@@ -204,6 +204,7 @@ void demux_packet_copy_attribs(struct demux_packet *dst, struct demux_packet *sr
     dst->back_preroll = src->back_preroll;
     dst->keyframe = src->keyframe;
     dst->stream = src->stream;
+    dst->read_ns = src->read_ns;
 }
 
 struct demux_packet *demux_copy_packet(struct demux_packet_pool *pool, struct demux_packet *dp)

@@ -113,8 +113,16 @@ struct vpsink_slot {
     // When vo.c's wait ended and flip_page began. Late here means mpv's
     // wait; between this and publish_time_ns is vo_vpsink's own wait.
     int64_t  flip_entry_ns;
-
-    uint32_t reserved[10];
+    // The frame's path upstream of SINK, same clock; 0 if not stamped. The
+    // packet times are the last packet the decoder took before this frame
+    // came out (decoders reorder, so not necessarily this frame's own).
+    // Read late: the demuxer (file or network). Sent late after an early
+    // read: the player thread. Decoded late after an early send: decode.
+    int64_t  pkt_read_ns;       // demuxer queued the packet
+    int64_t  pkt_sent_ns;       // decoder accepted the packet
+    int64_t  decoded_ns;        // decoder returned the frame
+    int64_t  ready_ns;          // frame left the decoder (after copy-back)
+    int64_t  queued_ns;         // player queued it to the VO
 };
 
 struct vpsink_header {

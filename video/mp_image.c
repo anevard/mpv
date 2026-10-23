@@ -567,6 +567,7 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->params.no_dovi = src->params.no_dovi;
     dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
     dst->av_tags = src->av_tags;
+    dst->stamps = src->stamps;
 
     // ensure colorspace consistency
     enum pl_color_system dst_forced_csp = mp_image_params_get_forced_csp(&dst->params);

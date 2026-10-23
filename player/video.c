@@ -1320,6 +1320,8 @@ void write_video(struct MPContext *mpctx)
     mpctx->osd_force_update = true;
     update_osd_msg(mpctx);
 
+    if (frame->current)
+        frame->current->stamps.queued_ns = mp_raw_time_ns();
     vo_queue_frame(vo, frame);
 
     check_framedrop(mpctx, vo_c);

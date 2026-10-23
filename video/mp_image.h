@@ -141,6 +141,15 @@ typedef struct mp_image {
         int range;              // enum AVColorRange
         int chroma_location;    // enum AVChromaLocation
     } av_tags;
+    // vo_vpsink diagnostics, mp_raw_time_ns(); 0 if not reached. The packet
+    // stamps are those of the last packet sent before this frame came out.
+    struct mp_vpsink_stamps {
+        int64_t pkt_read_ns;    // demuxer queued the packet
+        int64_t pkt_sent_ns;    // decoder accepted the packet
+        int64_t decoded_ns;     // decoder returned this frame
+        int64_t ready_ns;       // frame left vd_lavc (after copy-back)
+        int64_t queued_ns;      // player handed it to vo_queue_frame
+    } stamps;
 } mp_image_t;
 
 struct mp_ff_side_data {

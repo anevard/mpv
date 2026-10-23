@@ -34,6 +34,7 @@
 #include "options/m_config.h"
 #include "options/options.h"
 #include "osdep/threads.h"
+#include "osdep/timer.h"
 #include "misc/bstr.h"
 #include "common/av_common.h"
 #include "common/codecs.h"
@@ -254,6 +255,9 @@ typedef struct lavc_ctx {
     bool dr_failed;
     struct mp_image_pool *dr_pool;
     int dr_imgfmt, dr_w, dr_h, dr_stride_align;
+
+    // vo_vpsink diagnostics: stamps of the last packet the decoder accepted.
+    int64_t last_pkt_read_ns, last_pkt_sent_ns;
 
     struct mp_decoder public;
 } vd_ffmpeg_ctx;
@@ -1251,6 +1255,11 @@ static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
         return ret;
 
+    if (pkt && ret >= 0) {
+        ctx->last_pkt_read_ns = pkt->read_ns;
+        ctx->last_pkt_sent_ns = mp_raw_time_ns();
+    }
+
     if (ctx->hw_probing && ctx->num_sent_packets < 32 &&
         ctx->hwdec_opts->software_fallback <= 32)
     {
@@ -1318,6 +1327,9 @@ static int decode_frame(struct mp_filter *vd)
         av_frame_unref(ctx->pic);
         return ret;
     }
+    mpi->stamps.pkt_read_ns = ctx->last_pkt_read_ns;
+    mpi->stamps.pkt_sent_ns = ctx->last_pkt_sent_ns;
+    mpi->stamps.decoded_ns = mp_raw_time_ns();
 
     if (mpi->imgfmt == IMGFMT_CUDA && !mpi->planes[0]) {
         MP_ERR(vd, "CUDA frame without data. This is a FFmpeg bug.\n");
@@ -1416,6 +1428,7 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
         ctx->hw_probing = false;
     }
 
+    res->stamps.ready_ns = mp_raw_time_ns();
     *out_frame = MAKE_FRAME(MP_FRAME_VIDEO, res);
     return 0;
 }

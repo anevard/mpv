@@ -2160,6 +2160,8 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
     mp_assert(dp->stream == stream->index);
     mp_assert(!dp->next);
 
+    dp->read_ns = mp_raw_time_ns();
+
     struct demux_internal *in = ds->in;
 
     in->after_seek = false;

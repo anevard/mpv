@@ -170,6 +170,12 @@ static bool fill_slot(struct vo *vo, struct vpsink_slot *s,
         .chroma_location = img->av_tags.chroma_location,
     };
     copy_hdr10(&s->hdr10, img);
+
+    s->pkt_read_ns = img->stamps.pkt_read_ns;
+    s->pkt_sent_ns = img->stamps.pkt_sent_ns;
+    s->decoded_ns = img->stamps.decoded_ns;
+    s->ready_ns = img->stamps.ready_ns;
+    s->queued_ns = img->stamps.queued_ns;
     return true;
 }
 
