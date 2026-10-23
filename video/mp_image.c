@@ -566,6 +566,7 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->params.sys_orig = src->params.sys_orig;
     dst->params.no_dovi = src->params.no_dovi;
     dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
+    dst->av_tags = src->av_tags;
 
     // ensure colorspace consistency
     enum pl_color_system dst_forced_csp = mp_image_params_get_forced_csp(&dst->params);
@@ -1130,6 +1131,15 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
         dst->fields |= MP_IMGFIELD_TOP_FIRST;
     if (src->repeat_pict == 1)
         dst->fields |= MP_IMGFIELD_REPEAT_FIRST;
+
+    dst->av_tags = (struct mp_av_color_tags){
+        .set = true,
+        .primaries = src->color_primaries,
+        .trc = src->color_trc,
+        .space = src->colorspace,
+        .range = src->color_range,
+        .chroma_location = src->chroma_location,
+    };
 
     dst->params.repr.sys = pl_system_from_av(src->colorspace);
     dst->params.repr.levels = pl_levels_from_av(src->color_range);

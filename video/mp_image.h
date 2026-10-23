@@ -131,6 +131,16 @@ typedef struct mp_image {
     int num_ff_side_data;
     // Optional decoded enhancement-layer frame
     struct mp_image *enhancement_layer;
+    // Colour tags exactly as the decoder's AVFrame carried them, before mpv
+    // maps or guesses anything (params are rewritten later). vo_vpsink only.
+    struct mp_av_color_tags {
+        bool set;
+        int primaries;          // enum AVColorPrimaries
+        int trc;                // enum AVColorTransferCharacteristic
+        int space;              // enum AVColorSpace
+        int range;              // enum AVColorRange
+        int chroma_location;    // enum AVChromaLocation
+    } av_tags;
 } mp_image_t;
 
 struct mp_ff_side_data {
