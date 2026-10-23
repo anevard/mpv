@@ -37,11 +37,16 @@
 
 #define ALIGN_UP(x, a) (((x) + (a) - 1) / (a) * (a))
 
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
 struct priv {
     char *name;
 
     HANDLE map;
     HANDLE event;
+    HANDLE timer;               // high-resolution, for the final wait
     struct vpsink_header *hdr;
 
     int pending;                // slot filled by draw_frame, or -1
@@ -183,7 +188,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
 
     struct vpsink_slot *s = get_slot(p, n);
-    if (!fill_slot(vo, s, frame, img)) {
+    s->copy_start_ns = mp_raw_time_ns();
+    bool filled = fill_slot(vo, s, frame, img);
+    s->copy_end_ns = mp_raw_time_ns();
+    if (!filled) {
         InterlockedExchange((volatile LONG *)&s->state, VPSINK_SLOT_FREE);
         p->hdr->frames_dropped += 1;
         return VO_TRUE;
@@ -202,6 +210,20 @@ static void flip_page(struct vo *vo)
 
     struct vpsink_slot *s = get_slot(p, p->pending);
     p->pending = -1;
+
+    // vo.c's wait can return up to ~2 ms early (millisecond timed waits on
+    // Windows). Never publish before the display time: sleep on a
+    // high-resolution timer for most of the rest, then spin the last bit.
+    if (s->display_time_ns) {
+        int64_t left = s->display_time_ns - (int64_t)mp_raw_time_ns();
+        if (left > 500000 && p->timer) {
+            LARGE_INTEGER due = { .QuadPart = -(left - 300000) / 100 };
+            if (SetWaitableTimer(p->timer, &due, 0, NULL, NULL, FALSE))
+                WaitForSingleObject(p->timer, INFINITE);
+        }
+        while ((int64_t)mp_raw_time_ns() < s->display_time_ns)
+            YieldProcessor();
+    }
 
     s->frame_number = ++p->frame_number;
     s->publish_time_ns = mp_raw_time_ns();
@@ -251,6 +273,8 @@ static void uninit(struct vo *vo)
             p->hdr->writer_pid = 0;
         UnmapViewOfFile(p->hdr);
     }
+    if (p->timer)
+        CloseHandle(p->timer);
     if (p->event)
         CloseHandle(p->event);
     if (p->map)
@@ -346,6 +370,14 @@ static int preinit(struct vo *vo)
         p->hdr->magic = VPSINK_MAGIC;
     }
     p->hdr->writer_pid = GetCurrentProcessId();
+
+    // Windows 10 1803+. Without it flip_page only spins: a plain waitable
+    // timer can oversleep by a whole scheduler tick (~15 ms).
+    p->timer = CreateWaitableTimerExW(NULL, NULL,
+                                      CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                      TIMER_ALL_ACCESS);
+    if (!p->timer)
+        MP_VERBOSE(vo, "No high-resolution timer; spinning before publish.\n");
 
     MP_VERBOSE(vo, "Shared memory %s, %u slots of %llu bytes.\n", map_name,
                VPSINK_SLOT_COUNT, (unsigned long long)slot_stride);
