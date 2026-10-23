@@ -105,7 +105,13 @@ struct vpsink_slot {
     struct vpsink_color_tags tags;
     struct vpsink_hdr10 hdr10;
 
-    uint32_t reserved[16];
+    // Diagnostics, same clock: when the writer began and finished copying
+    // this frame into the slot. A late publish_time_ns with a late
+    // copy_start_ns means mpv woke late; with a long copy, the copy was slow.
+    int64_t  copy_start_ns;
+    int64_t  copy_end_ns;
+
+    uint32_t reserved[12];
 };
 
 struct vpsink_header {
