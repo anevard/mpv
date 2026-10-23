@@ -67,6 +67,9 @@ typedef struct demux_packet {
     int seen_pos;
     double sub_duration;
 
+    // vo_vpsink diagnostics: mp_raw_time_ns() when the demuxer queued it.
+    int64_t read_ns;
+
     // private
     struct demux_packet *next;
     struct AVPacket *avpacket;   // keep the buffer allocation and sidedata
