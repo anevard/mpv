@@ -110,8 +110,11 @@ struct vpsink_slot {
     // copy_start_ns means mpv woke late; with a long copy, the copy was slow.
     int64_t  copy_start_ns;
     int64_t  copy_end_ns;
+    // When vo.c's wait ended and flip_page began. Late here means mpv's
+    // wait; between this and publish_time_ns is vo_vpsink's own wait.
+    int64_t  flip_entry_ns;
 
-    uint32_t reserved[12];
+    uint32_t reserved[10];
 };
 
 struct vpsink_header {
