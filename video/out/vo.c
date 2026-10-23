@@ -54,6 +54,7 @@ extern const struct vo_driver video_out_gpu;
 extern const struct vo_driver video_out_gpu_next;
 extern const struct vo_driver video_out_libmpv;
 extern const struct vo_driver video_out_null;
+extern const struct vo_driver video_out_vpsink;
 extern const struct vo_driver video_out_image;
 extern const struct vo_driver video_out_lavc;
 extern const struct vo_driver video_out_caca;
@@ -106,6 +107,9 @@ static const struct vo_driver *const video_out_drivers[] =
     // should not be auto-selected
     &video_out_image,
     &video_out_tct,
+#if HAVE_WIN32
+    &video_out_vpsink,
+#endif
 #if HAVE_CACA
     &video_out_caca,
 #endif
