@@ -210,6 +210,7 @@ static void flip_page(struct vo *vo)
 
     struct vpsink_slot *s = get_slot(p, p->pending);
     p->pending = -1;
+    s->flip_entry_ns = mp_raw_time_ns();
 
     // vo.c's wait can return up to ~2 ms early (millisecond timed waits on
     // Windows). Never publish before the display time: sleep on a
