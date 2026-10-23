@@ -22,6 +22,7 @@
  */
 
 #include <windows.h>
+#include <avrt.h>
 
 #include <libavutil/frame.h>
 #include <libavutil/mastering_display_metadata.h>
@@ -29,6 +30,7 @@
 #include "common/msg.h"
 #include "mpv_talloc.h"
 #include "options/m_option.h"
+#include "options/options.h"
 #include "osdep/io.h"
 #include "osdep/timer.h"
 #include "video/mp_image.h"
@@ -47,6 +49,7 @@ struct priv {
     HANDLE map;
     HANDLE event;
     HANDLE timer;               // high-resolution, for the final wait
+    HANDLE avrt;                // MMCSS registration of the VO thread
     struct vpsink_header *hdr;
 
     int pending;                // slot filled by draw_frame, or -1
@@ -274,6 +277,9 @@ static void uninit(struct vo *vo)
             p->hdr->writer_pid = 0;
         UnmapViewOfFile(p->hdr);
     }
+    if (p->avrt)
+        AvRevertMmThreadCharacteristics(p->avrt);
+    p->avrt = NULL;
     if (p->timer)
         CloseHandle(p->timer);
     if (p->event)
@@ -379,6 +385,18 @@ static int preinit(struct vo *vo)
                                       TIMER_ALL_ACCESS);
     if (!p->timer)
         MP_VERBOSE(vo, "No high-resolution timer; spinning before publish.\n");
+
+    // preinit runs on the VO thread. Register it with MMCSS as mpv's window
+    // VOs do (w32_common.c, --vo-mmcss-profile, "Playback" by default).
+    // Without it this thread was measured waking 10-50 ms late several times
+    // a minute; with it, never more than ~1 ms.
+    if (vo->opts->mmcss_profile && vo->opts->mmcss_profile[0]) {
+        wchar_t *profile = mp_from_utf8(NULL, vo->opts->mmcss_profile);
+        p->avrt = AvSetMmThreadCharacteristicsW(profile, &(DWORD){0});
+        talloc_free(profile);
+        if (!p->avrt)
+            MP_WARN(vo, "Cannot register the VO thread with MMCSS.\n");
+    }
 
     MP_VERBOSE(vo, "Shared memory %s, %u slots of %llu bytes.\n", map_name,
                VPSINK_SLOT_COUNT, (unsigned long long)slot_stride);
