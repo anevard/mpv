@@ -116,11 +116,15 @@ struct vpsink_slot {
     // The frame's path upstream of SINK, same clock; 0 if not stamped. The
     // packet times are the last packet the decoder took before this frame
     // came out (decoders reorder, so not necessarily this frame's own).
+    // Judge each against display_time_ns, not against the stage before.
     // Read late: the demuxer (file or network). Sent late after an early
-    // read: the player thread. Decoded late after an early send: decode.
+    // read: the player thread. Ready late after an early send: decode or
+    // copy-back. With hardware decode the decoder returns a frame before
+    // the GPU finishes it, so decoded_ns follows the send at once and the
+    // decode work shows between decoded_ns and ready_ns.
     int64_t  pkt_read_ns;       // demuxer queued the packet
     int64_t  pkt_sent_ns;       // decoder accepted the packet
-    int64_t  decoded_ns;        // decoder returned the frame
+    int64_t  decoded_ns;        // decoder returned the frame (not finished)
     int64_t  ready_ns;          // frame left the decoder (after copy-back)
     int64_t  queued_ns;         // player queued it to the VO
 };
