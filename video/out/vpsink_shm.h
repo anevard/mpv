@@ -30,7 +30,7 @@
 #include <stdint.h>
 
 #define VPSINK_MAGIC        0x4B4E5356u   // "VSNK"
-#define VPSINK_VERSION      1u
+#define VPSINK_VERSION      2u
 #define VPSINK_SLOT_COUNT   3u
 
 // Largest frame a slot holds: 4096x2304 P010 (Y plane plus half-height UV).
@@ -53,6 +53,9 @@ enum vpsink_format {
 // vpsink_slot.flags
 #define VPSINK_FLAG_DISCONTINUITY   (1u << 0)   // first frame after a seek,
                                                 // reset or format change
+#define VPSINK_FLAG_STILL           (1u << 1)   // paused redraw: the same
+                                                // picture with new subtitles
+                                                // or OSD text
 
 // Colour tags as the AVFrame carried them (AVCOL_*). set == 0 means the
 // frame did not come from the decoder, so no tags are known at all.
@@ -127,6 +130,11 @@ struct vpsink_slot {
     int64_t  decoded_ns;        // decoder returned the frame (not finished)
     int64_t  ready_ns;          // frame left the decoder (after copy-back)
     int64_t  queued_ns;         // player queued it to the VO
+    // When the writer began and finished the subtitle step: rendering the
+    // subtitles (and the OSD text, if enabled) and drawing them into the
+    // slot. Present on every frame; short when nothing shows.
+    int64_t  draw_start_ns;
+    int64_t  draw_end_ns;
 };
 
 struct vpsink_header {
