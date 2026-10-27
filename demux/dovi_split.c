@@ -192,8 +192,11 @@ struct demux_packet *mp_dovi_split_dispatch(struct mp_dovi_split *s,
         new_demux_packet_from_avpacket(s->demuxer->packet_pool, s->staging);
     if (dp) {
         // Mirror the BL packet's timing so the pairing filter can match by PTS.
+        // Its file position too: without one the EL queue never counts as
+        // ordered, and demux refuses every refresh seek (track switches).
         dp->pts = bl_dp->pts;
         dp->dts = bl_dp->dts;
+        dp->pos = bl_dp->pos;
         dp->duration = bl_dp->duration;
         dp->keyframe = bl_dp->keyframe;
         dp->stream = s->el->index;
