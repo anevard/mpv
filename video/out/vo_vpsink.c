@@ -1,9 +1,11 @@
 /*
  * vo_vpsink: hand each decoded frame to VideoProcessor through shared memory.
  *
- * Draws nothing. Behaves like a capture card: each frame becomes visible to
- * the reader at its display time, mpv is never blocked, and a frame with no
- * free slot is dropped and counted. The contract is vpsink_shm.h.
+ * Behaves like a capture card: each frame becomes visible to the reader at
+ * its display time, mpv is never blocked, and a frame with no free slot is
+ * dropped and counted. Subtitles (and, if enabled, mpv's OSD text) are drawn
+ * into the slot's copy, never into the decoder's frame. The contract is
+ * vpsink_shm.h.
  *
  * This file is part of mpv.
  *
@@ -33,6 +35,7 @@
 #include "options/options.h"
 #include "osdep/io.h"
 #include "osdep/timer.h"
+#include "sub/osd.h"
 #include "video/mp_image.h"
 #include "vo.h"
 #include "vpsink_shm.h"
@@ -45,6 +48,8 @@
 
 struct priv {
     char *name;
+    int sub_nits;               // subtitle white in an HDR frame, cd/m2
+    bool osd;                   // also draw mpv's OSD text, not only subtitles
 
     HANDLE map;
     HANDLE event;
@@ -54,6 +59,7 @@ struct priv {
 
     int pending;                // slot filled by draw_frame, or -1
     bool discontinuity;         // flag the next published frame
+    bool paused;                // VOCTRL_PAUSE seen, no VOCTRL_RESUME since
     uint64_t frame_number;
     int64_t raw_offset;         // mp_raw_time_ns() - mp_time_ns()
 };
@@ -179,15 +185,49 @@ static bool fill_slot(struct vo *vo, struct vpsink_slot *s,
     return true;
 }
 
+// Draw the subtitles for img's time (and the OSD text, if enabled) into the
+// slot's copy of img. draw_bmp touches only the areas that hold them.
+static void draw_subs(struct vo *vo, struct vpsink_slot *s, struct mp_image *img)
+{
+    struct priv *p = vo->priv;
+
+    struct mp_image dst = {0};
+    mp_image_set_params(&dst, &img->params);
+    for (int n = 0; n < 2; n++) {
+        dst.planes[n] = (uint8_t *)s + s->plane_offset[n];
+        dst.stride[n] = s->plane_stride[n];
+    }
+
+    // draw_bmp converts subtitle colour to the video's with zimg, which puts
+    // subtitle white at the frame's mastering peak (video/zimg.c). Give it
+    // our level instead; only this drawing sees it, the slot's HDR10
+    // metadata is the frame's own. Dynamic metadata is cleared, as
+    // mp_image_params_static_equal() does, so it does not rebuild draw_bmp's
+    // cache on every frame.
+    bool hdr = pl_color_space_is_hdr(&dst.params.color);
+    dst.params.repr.dovi = NULL;
+    dst.params.color.hdr = (struct pl_hdr_metadata){0};
+    if (hdr)
+        dst.params.color.hdr.max_luma = p->sub_nits;
+
+    s->draw_start_ns = mp_raw_time_ns();
+    osd_draw_on_image(vo->osd, osd_res_from_image_params(&dst.params), img->pts,
+                      p->osd ? 0 : OSD_DRAW_SUB_ONLY, &dst);
+    s->draw_end_ns = mp_raw_time_ns();
+}
+
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
     p->pending = -1;
 
-    // Repeats and redraws (OSD, pause) are the same picture again: a card
-    // would not deliver them as new frames, so neither do we.
+    // Repeats and redraws are the same picture again: a card would not
+    // deliver them as new frames, so neither do we. Except a redraw while
+    // paused: it carries new subtitles or OSD text (a track change, a
+    // message), so it goes out once as a still frame and shows at once.
     struct mp_image *img = frame->current;
-    if (!img || frame->repeat || frame->redraw)
+    bool still = frame->still && p->paused;     // only do_redraw sets still
+    if (!img || frame->repeat || (frame->redraw && !still))
         return VO_TRUE;
 
     int n = acquire_slot(p);
@@ -205,6 +245,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         p->hdr->frames_dropped += 1;
         return VO_TRUE;
     }
+    if (still)
+        s->flags |= VPSINK_FLAG_STILL;
+    draw_subs(vo, s, img);
 
     p->pending = n;
     return VO_TRUE;
@@ -423,6 +466,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
         // Seek or flush: the next frame does not follow the last one.
         p->discontinuity = true;
         return VO_TRUE;
+    case VOCTRL_PAUSE:
+    case VOCTRL_RESUME:
+        p->paused = request == VOCTRL_PAUSE;
+        return VO_TRUE;
     }
     return VO_NOTIMPL;
 }
@@ -439,8 +486,13 @@ const struct vo_driver video_out_vpsink = {
     .flip_page = flip_page,
     .uninit = uninit,
     .priv_size = sizeof(struct priv),
+    .priv_defaults = &(const struct priv) {
+        .sub_nits = 50,
+    },
     .options = (const struct m_option[]) {
         {"name", OPT_STRING(name)},
+        {"sub-nits", OPT_INT(sub_nits), M_RANGE(10, 1000)},
+        {"osd", OPT_BOOL(osd)},
         {0},
     },
     .options_prefix = "vo-vpsink",
