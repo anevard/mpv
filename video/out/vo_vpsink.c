@@ -3,9 +3,9 @@
  *
  * Behaves like a capture card: each frame becomes visible to the reader at
  * its display time, mpv is never blocked, and a frame with no free slot is
- * dropped and counted. Subtitles (and, if enabled, mpv's OSD text) are drawn
- * into the slot's copy, never into the decoder's frame. The contract is
- * vpsink_shm.h.
+ * dropped and counted. Subtitles (and, if enabled, mpv's OSD message) are
+ * never drawn into the picture: each frame carries them as cue images for
+ * the reader to draw. The contract is vpsink_shm.h.
  *
  * This file is part of mpv.
  *
@@ -23,18 +23,21 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <math.h>
 #include <windows.h>
 #include <avrt.h>
 
 #include <libavutil/frame.h>
 #include <libavutil/mastering_display_metadata.h>
 
+#include "common/common.h"
 #include "common/msg.h"
 #include "mpv_talloc.h"
 #include "options/m_option.h"
 #include "options/options.h"
 #include "osdep/io.h"
 #include "osdep/timer.h"
+#include "sub/draw_bmp.h"
 #include "sub/osd.h"
 #include "video/mp_image.h"
 #include "vo.h"
@@ -46,10 +49,32 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
+// Image subtitles in an HDR film are in the video's colour space. This level
+// becomes cue white: BT.2408's graphics white, mpv's "sdr" for
+// --image-subs-hdr-peak. Brighter is clipped.
+#define CUE_WHITE_NITS  203.0f
+
+// HLG to display light at BT.2100's nominal 1000 cd/m2 display.
+#define HLG_PEAK_NITS   1000.0f
+#define HLG_GAMMA       1.2f
+
+#define LIN_LUT_SIZE    4096    // encoded value -> linear, one transfer
+#define ENC_LUT_SIZE    16384   // linear (0..1) -> sRGB encoded
+
+// One cue as the writer keeps it between frames: rendered and converted once
+// per change, copied into every slot while it shows.
+struct cue {
+    struct mp_draw_sub_cache *cache;
+    bool valid;                 // change_id and the pixels below are current
+    int64_t change_id;          // of the sub_bitmap_list last rendered
+    uint64_t id;                // 0: nothing showing
+    struct mp_rect rc;          // bounds in the frame's pixels
+    uint8_t *px;                // rc's pixels, BGRA premultiplied, w * 4 a row
+};
+
 struct priv {
     char *name;
-    int sub_nits;               // subtitle white in an HDR frame, cd/m2
-    bool osd;                   // also draw mpv's OSD text, not only subtitles
+    bool osd;                   // also hand over mpv's OSD message as a cue
 
     HANDLE map;
     HANDLE event;
@@ -62,6 +87,19 @@ struct priv {
     bool paused;                // VOCTRL_PAUSE seen, no VOCTRL_RESUME since
     uint64_t frame_number;
     int64_t raw_offset;         // mp_raw_time_ns() - mp_time_ns()
+    uint64_t picture_capacity;  // bytes of a slot's pixel data for the
+                                // picture; the cue area follows
+
+    struct cue sub;
+    struct cue msg;
+    uint64_t last_cue_id;
+
+    // HDR image-subtitle conversion. lin_lut is for lin_trc: PQ in units of
+    // CUE_WHITE_NITS, HLG as scene light (0..1).
+    enum pl_color_transfer lin_trc;
+    float lin_lut[LIN_LUT_SIZE];
+    float enc_lut[ENC_LUT_SIZE];
+    bool enc_lut_ready;
 };
 
 static struct vpsink_slot *get_slot(struct priv *p, int n)
@@ -147,7 +185,7 @@ static bool fill_slot(struct vo *vo, struct vpsink_slot *s,
         int row_bytes = mp_image_plane_w(img, n) * img->fmt.bpp[n] / 8;
         int rows = mp_image_plane_h(img, n);
         uint32_t stride = ALIGN_UP(row_bytes, 64);
-        if (used + (uint64_t)stride * rows > p->hdr->slot_data_capacity)
+        if (used + (uint64_t)stride * rows > p->picture_capacity)
             return false;
         s->plane_offset[n] = p->hdr->slot_data_offset + used;
         s->plane_stride[n] = stride;
@@ -185,34 +223,198 @@ static bool fill_slot(struct vo *vo, struct vpsink_slot *s,
     return true;
 }
 
-// Draw the subtitles for img's time (and the OSD text, if enabled) into the
-// slot's copy of img. draw_bmp touches only the areas that hold them.
-static void draw_subs(struct vo *vo, struct vpsink_slot *s, struct mp_image *img)
+// Encoded value (0..1) to linear for trc: PQ in units of CUE_WHITE_NITS,
+// HLG as scene light (0..1; the OOTF needs all three channels).
+static float trc_to_linear(enum pl_color_transfer trc, float e)
+{
+    if (trc == PL_COLOR_TRC_PQ) {
+        const float m1 = 2610.0f / 16384, m2 = 2523.0f / 4096 * 128;
+        const float c1 = 3424.0f / 4096, c2 = 2413.0f / 4096 * 32,
+                    c3 = 2392.0f / 4096 * 32;
+        float x = powf(e, 1 / m2);
+        float y = powf(MPMAX(x - c1, 0) / (c2 - c3 * x), 1 / m1);
+        return y * 10000.0f / CUE_WHITE_NITS;
+    }
+    const float a = 0.17883277f, b = 0.28466892f, c = 0.55991073f;
+    return e <= 0.5f ? e * e / 3 : (expf((e - c) / a) + b) / 12;
+}
+
+static float srgb_encode(float l)
+{
+    return l <= 0.0031308f ? l * 12.92f : 1.055f * powf(l, 1 / 2.4f) - 0.055f;
+}
+
+// Convert an image-subtitle cue from an HDR film's colour space to sRGB, in
+// place. Each pixel is un-premultiplied, converted and premultiplied again,
+// so edges keep their colour.
+static void convert_hdr_cue(struct priv *p, struct cue *c,
+                            const struct pl_color_space *color)
+{
+    enum pl_color_transfer trc = color->transfer;
+    if (p->lin_trc != trc) {
+        for (int n = 0; n < LIN_LUT_SIZE; n++)
+            p->lin_lut[n] = trc_to_linear(trc, n / (float)(LIN_LUT_SIZE - 1));
+        p->lin_trc = trc;
+    }
+    if (!p->enc_lut_ready) {
+        for (int n = 0; n < ENC_LUT_SIZE; n++)
+            p->enc_lut[n] = srgb_encode(n / (float)(ENC_LUT_SIZE - 1));
+        p->enc_lut_ready = true;
+    }
+
+    enum pl_color_primaries prim = color->primaries ? color->primaries
+                                                    : PL_COLOR_PRIM_BT_2020;
+    pl_matrix3x3 gamut = pl_get_color_mapping_matrix(
+        pl_raw_primaries_get(prim), pl_raw_primaries_get(PL_COLOR_PRIM_BT_709),
+        PL_INTENT_RELATIVE_COLORIMETRIC);
+
+    int w = c->rc.x1 - c->rc.x0, h = c->rc.y1 - c->rc.y0;
+    for (int y = 0; y < h; y++) {
+        uint8_t *px = c->px + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++, px += 4) {
+            int a = px[3];
+            if (!a)
+                continue;
+            float rgb[3];
+            for (int ch = 0; ch < 3; ch++) {
+                float e = MPMIN(px[2 - ch] / (float)a, 1.0f);   // B,G,R order
+                rgb[ch] = p->lin_lut[(int)(e * (LIN_LUT_SIZE - 1) + 0.5f)];
+            }
+            if (trc == PL_COLOR_TRC_HLG) {
+                float ys = 0.2627f * rgb[0] + 0.6780f * rgb[1] + 0.0593f * rgb[2];
+                float k = HLG_PEAK_NITS * powf(ys, HLG_GAMMA - 1) / CUE_WHITE_NITS;
+                for (int ch = 0; ch < 3; ch++)
+                    rgb[ch] *= k;
+            }
+            pl_matrix3x3_apply(&gamut, rgb);
+            for (int ch = 0; ch < 3; ch++) {
+                float l = MPCLAMP(rgb[ch], 0.0f, 1.0f);
+                float e = p->enc_lut[(int)(l * (ENC_LUT_SIZE - 1) + 0.5f)];
+                px[2 - ch] = (uint8_t)(e * a + 0.5f);
+            }
+        }
+    }
+}
+
+// Shrink rc to the pixels of ov that are not fully transparent. draw_bmp
+// reports its active area in whole tiles; the reader places by exact bounds.
+static struct mp_rect tight_bounds(struct mp_image *ov, struct mp_rect rc)
+{
+    rc.x0 = MPMAX(rc.x0, 0);
+    rc.y0 = MPMAX(rc.y0, 0);
+    rc.x1 = MPMIN(rc.x1, ov->w);
+    rc.y1 = MPMIN(rc.y1, ov->h);
+    struct mp_rect t = {rc.x1, rc.y1, rc.x0, rc.y0};
+    for (int y = rc.y0; y < rc.y1; y++) {
+        const uint8_t *row = ov->planes[0] + (ptrdiff_t)y * ov->stride[0];
+        for (int x = rc.x0; x < rc.x1; x++) {
+            if (row[x * 4 + 3]) {
+                t.x0 = MPMIN(t.x0, x);
+                t.x1 = MPMAX(t.x1, x + 1);
+                t.y0 = MPMIN(t.y0, y);
+                t.y1 = MPMAX(t.y1, y + 1);
+            }
+        }
+    }
+    return t;
+}
+
+// Bring cue c up to date for img's time. Renders only when mpv reports a
+// change; a changed image gets a new id.
+static void render_cue(struct vo *vo, struct cue *c, struct mp_image *img,
+                       int draw_flags)
 {
     struct priv *p = vo->priv;
 
-    struct mp_image dst = {0};
-    mp_image_set_params(&dst, &img->params);
-    for (int n = 0; n < 2; n++) {
-        dst.planes[n] = (uint8_t *)s + s->plane_offset[n];
-        dst.stride[n] = s->plane_stride[n];
+    struct sub_bitmap_list *sbs =
+        osd_render(vo->osd, osd_res_from_image_params(&img->params), img->pts,
+                   draw_flags, mp_draw_sub_formats);
+    if (c->valid && sbs->change_id == c->change_id) {
+        talloc_free(sbs);
+        return;
     }
 
-    // draw_bmp converts subtitle colour to the video's with zimg, which puts
-    // subtitle white at the frame's mastering peak (video/zimg.c). Give it
-    // our level instead; only this drawing sees it, the slot's HDR10
-    // metadata is the frame's own. Dynamic metadata is cleared, as
-    // mp_image_params_static_equal() does, so it does not rebuild draw_bmp's
-    // cache on every frame.
-    bool hdr = pl_color_space_is_hdr(&dst.params.color);
-    dst.params.repr.dovi = NULL;
-    dst.params.color.hdr = (struct pl_hdr_metadata){0};
-    if (hdr)
-        dst.params.color.hdr.max_luma = p->sub_nits;
+    // mpv marks image subtitles as in the video's colour space (sd_lavc.c).
+    bool video_space = false;
+    for (int n = 0; n < sbs->num_items; n++) {
+        if (sbs->items[n]->format == SUBBITMAP_BGRA &&
+            sbs->items[n]->video_color_space)
+            video_space = true;
+    }
+
+    if (!c->cache)
+        c->cache = mp_draw_sub_alloc(vo, vo->global);
+    struct mp_rect act, mod;
+    int num_act = 0, num_mod = 0;
+    struct mp_image *ov = mp_draw_sub_overlay(c->cache, sbs, &act, 1, &num_act,
+                                              &mod, 1, &num_mod);
+    int64_t change_id = sbs->change_id;
+    talloc_free(sbs);
+
+    c->valid = false;
+    c->id = 0;
+    if (!ov) {
+        MP_WARN(vo, "Cannot render a subtitle or OSD cue.\n");
+        return;
+    }
+    c->valid = true;
+    c->change_id = change_id;
+    if (!num_act)
+        return;
+
+    c->rc = tight_bounds(ov, act);
+    int w = c->rc.x1 - c->rc.x0, h = c->rc.y1 - c->rc.y0;
+    if (w <= 0 || h <= 0)
+        return;
+    c->px = talloc_realloc_size(vo, c->px, (size_t)w * h * 4);
+    memcpy_pic(c->px, mp_image_pixel_ptr(ov, 0, c->rc.x0, c->rc.y0), w * 4, h,
+               w * 4, ov->stride[0]);
+
+    enum pl_color_transfer trc = img->params.color.transfer;
+    if (video_space && (trc == PL_COLOR_TRC_PQ || trc == PL_COLOR_TRC_HLG))
+        convert_hdr_cue(p, c, &img->params.color);
+
+    c->id = ++p->last_cue_id;
+}
+
+// Copy cue c into the slot's cue area at *used, or mark it absent.
+static void put_cue(struct priv *p, struct vpsink_slot *s, struct vpsink_cue *dst,
+                    struct cue *c, uint64_t *used)
+{
+    *dst = (struct vpsink_cue){0};
+    if (!c->id)
+        return;
+    uint32_t w = c->rc.x1 - c->rc.x0, h = c->rc.y1 - c->rc.y0;
+    uint32_t stride = ALIGN_UP(w * 4, 64);
+    if (*used + (uint64_t)stride * h > VPSINK_CUE_AREA_SIZE)
+        return;     // only the message can miss: a subtitle always fits
+    uint64_t offset = p->hdr->slot_data_offset + p->picture_capacity + *used;
+    memcpy_pic((uint8_t *)s + offset, c->px, w * 4, h, stride, w * 4);
+    *dst = (struct vpsink_cue){
+        .id = c->id,
+        .x = c->rc.x0,
+        .y = c->rc.y0,
+        .w = w,
+        .h = h,
+        .offset = offset,
+        .stride = stride,
+    };
+    *used += (uint64_t)stride * h;
+}
+
+// Bring the subtitle cue (and the OSD message cue, if enabled) up to date for
+// img's time and copy them into the slot.
+static void draw_cues(struct vo *vo, struct vpsink_slot *s, struct mp_image *img)
+{
+    struct priv *p = vo->priv;
 
     s->draw_start_ns = mp_raw_time_ns();
-    osd_draw_on_image(vo->osd, osd_res_from_image_params(&dst.params), img->pts,
-                      p->osd ? 0 : OSD_DRAW_SUB_ONLY, &dst);
+    render_cue(vo, &p->sub, img, OSD_DRAW_SUB_ONLY);
+    if (p->osd)
+        render_cue(vo, &p->msg, img, OSD_DRAW_OSD_ONLY);
+    uint64_t used = 0;
+    put_cue(p, s, &s->sub, &p->sub, &used);
+    put_cue(p, s, &s->msg, &p->msg, &used);
     s->draw_end_ns = mp_raw_time_ns();
 }
 
@@ -223,8 +425,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     // Repeats and redraws are the same picture again: a card would not
     // deliver them as new frames, so neither do we. Except a redraw while
-    // paused: it carries new subtitles or OSD text (a track change, a
-    // message), so it goes out once as a still frame and shows at once.
+    // paused: it carries a new subtitle or OSD message cue (a track change,
+    // a message), so it goes out once as a still frame and shows at once.
     struct mp_image *img = frame->current;
     bool still = frame->still && p->paused;     // only do_redraw sets still
     if (!img || frame->repeat || (frame->redraw && !still))
@@ -247,7 +449,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
     if (still)
         s->flags |= VPSINK_FLAG_STILL;
-    draw_subs(vo, s, img);
+    draw_cues(vo, s, img);
 
     p->pending = n;
     return VO_TRUE;
@@ -311,6 +513,8 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
         return -1;
     }
     p->discontinuity = true;
+    // Size or colour may have changed: render and convert the cues again.
+    p->sub.valid = p->msg.valid = false;
     return 0;
 }
 
@@ -348,9 +552,11 @@ static int preinit(struct vo *vo)
 
     uint32_t header_size = ALIGN_UP(sizeof(struct vpsink_header), 4096);
     uint32_t slot_data_offset = ALIGN_UP(sizeof(struct vpsink_slot), 4096);
-    // Y plane plus half-height UV plane, 2 bytes per sample, rows padded to 64.
-    uint64_t capacity = (uint64_t)ALIGN_UP(VPSINK_MAX_WIDTH * 2, 64) *
-                        (VPSINK_MAX_HEIGHT + VPSINK_MAX_HEIGHT / 2);
+    // Y plane plus half-height UV plane, 2 bytes per sample, rows padded to 64,
+    // then the cue area.
+    p->picture_capacity = (uint64_t)ALIGN_UP(VPSINK_MAX_WIDTH * 2, 64) *
+                          (VPSINK_MAX_HEIGHT + VPSINK_MAX_HEIGHT / 2);
+    uint64_t capacity = p->picture_capacity + VPSINK_CUE_AREA_SIZE;
     uint64_t slot_stride = ALIGN_UP(slot_data_offset + capacity, 4096);
     uint64_t total = header_size + VPSINK_SLOT_COUNT * slot_stride;
 
@@ -486,12 +692,8 @@ const struct vo_driver video_out_vpsink = {
     .flip_page = flip_page,
     .uninit = uninit,
     .priv_size = sizeof(struct priv),
-    .priv_defaults = &(const struct priv) {
-        .sub_nits = 50,
-    },
     .options = (const struct m_option[]) {
         {"name", OPT_STRING(name)},
-        {"sub-nits", OPT_INT(sub_nits), M_RANGE(10, 1000)},
         {"osd", OPT_BOOL(osd)},
         {0},
     },

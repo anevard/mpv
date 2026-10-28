@@ -12,7 +12,14 @@
  *
  * Layout: struct vpsink_header at offset 0, then slot_count slots, each
  * slot_stride bytes apart starting at header_size. A slot is a
- * struct vpsink_slot followed by pixel data at slot_data_offset.
+ * struct vpsink_slot followed by pixel data at slot_data_offset: the
+ * picture's planes, then the cue area holding that frame's cues.
+ *
+ * Cues: mpv's subtitles and its OSD message are not drawn into the picture.
+ * Each slot carries the frame's subtitle cue and message cue as images in
+ * its cue area, cropped to what they cover, with an id that changes only
+ * when the image does. Every frame carries its cues, so a frame the reader
+ * skips loses nothing; the reader need copy a cue only when its id changes.
  *
  * Slot protocol (all state changes by interlocked compare-exchange):
  *   writer: FREE or READY -> WRITING (copy pixels and fields)
@@ -30,12 +37,16 @@
 #include <stdint.h>
 
 #define VPSINK_MAGIC        0x4B4E5356u   // "VSNK"
-#define VPSINK_VERSION      2u
+#define VPSINK_VERSION      3u
 #define VPSINK_SLOT_COUNT   3u
 
 // Largest frame a slot holds: 4096x2304 P010 (Y plane plus half-height UV).
 #define VPSINK_MAX_WIDTH    4096u
 #define VPSINK_MAX_HEIGHT   2304u
+
+// The cue area holds a full-frame cue: VPSINK_MAX_WIDTH x VPSINK_MAX_HEIGHT
+// at 4 bytes a pixel.
+#define VPSINK_CUE_AREA_SIZE ((uint64_t)VPSINK_MAX_WIDTH * 4u * VPSINK_MAX_HEIGHT)
 
 enum vpsink_slot_state {
     VPSINK_SLOT_FREE    = 0,
@@ -81,6 +92,21 @@ struct vpsink_hdr10 {
     uint32_t max_cll;
     uint32_t max_fall;
     uint32_t reserved;
+};
+
+// One cue: premultiplied-alpha pixels, bytes B, G, R, A in memory order
+// (DXGI_FORMAT_B8G8R8A8_UNORM), sRGB. Subtitles from an HDR film arrive
+// converted: 203 cd/m2 is white (1.0), brighter is clipped. The receiver
+// chooses the level white is shown at.
+struct vpsink_cue {
+    uint64_t id;                // 0: no cue on this frame. Otherwise unique
+                                // to one image; repeats while it is unchanged
+    int32_t  x;                 // bounds in the frame's pixels (width x
+    int32_t  y;                 // height, before sample aspect ratio)
+    uint32_t w;
+    uint32_t h;
+    uint32_t offset;            // from the start of the slot
+    uint32_t stride;            // bytes per row
 };
 
 struct vpsink_slot {
@@ -130,11 +156,14 @@ struct vpsink_slot {
     int64_t  decoded_ns;        // decoder returned the frame (not finished)
     int64_t  ready_ns;          // frame left the decoder (after copy-back)
     int64_t  queued_ns;         // player queued it to the VO
-    // When the writer began and finished the subtitle step: rendering the
-    // subtitles (and the OSD text, if enabled) and drawing them into the
-    // slot. Present on every frame; short when nothing shows.
+    // When the writer began and finished the cue step: rendering the
+    // subtitles (and the OSD message, if enabled), and copying the cues into
+    // the slot. Present on every frame; short when nothing shows.
     int64_t  draw_start_ns;
     int64_t  draw_end_ns;
+
+    struct vpsink_cue sub;      // the subtitle track's cue
+    struct vpsink_cue msg;      // mpv's OSD message (vo-vpsink-osd), if any
 };
 
 struct vpsink_header {
