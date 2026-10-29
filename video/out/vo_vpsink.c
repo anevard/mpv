@@ -5,7 +5,9 @@
  * its display time, mpv is never blocked, and a frame with no free slot is
  * dropped and counted. Subtitles (and, if enabled, mpv's OSD message) are
  * never drawn into the picture: each frame carries them as cue images for
- * the reader to draw. The contract is vpsink_shm.h.
+ * the reader to draw. With --vo-vpsink-dv, a Dolby Vision frame is composed
+ * on a GPU into the BGRA8 tunnel picture a TV-led player sends (vpsink_dv.c),
+ * and dropped if it would show late. The contract is vpsink_shm.h.
  *
  * This file is part of mpv.
  *
@@ -41,6 +43,7 @@
 #include "sub/osd.h"
 #include "video/mp_image.h"
 #include "vo.h"
+#include "vpsink_dv.h"
 #include "vpsink_shm.h"
 
 #define ALIGN_UP(x, a) (((x) + (a) - 1) / (a) * (a))
@@ -75,6 +78,9 @@ struct cue {
 struct priv {
     char *name;
     bool osd;                   // also hand over mpv's OSD message as a cue
+    bool dv;                    // compose Dolby Vision frames as BGRA8 tunnel
+                                // pictures (vpsink_dv.c)
+    struct vpsink_dv *dvc;      // NULL unless dv
 
     HANDLE map;
     HANDLE event;
@@ -174,29 +180,11 @@ static void copy_hdr10(struct vpsink_hdr10 *dst, struct mp_image *img)
     }
 }
 
-static bool fill_slot(struct vo *vo, struct vpsink_slot *s,
-                      struct vo_frame *frame, struct mp_image *img)
+// Everything about the frame but its pixels.
+static void fill_fields(struct vo *vo, struct vpsink_slot *s,
+                        struct vo_frame *frame, struct mp_image *img)
 {
     struct priv *p = vo->priv;
-    uint8_t *data = (uint8_t *)s + p->hdr->slot_data_offset;
-    uint64_t used = 0;
-
-    for (int n = 0; n < 2; n++) {
-        int row_bytes = mp_image_plane_w(img, n) * img->fmt.bpp[n] / 8;
-        int rows = mp_image_plane_h(img, n);
-        uint32_t stride = ALIGN_UP(row_bytes, 64);
-        if (used + (uint64_t)stride * rows > p->picture_capacity)
-            return false;
-        s->plane_offset[n] = p->hdr->slot_data_offset + used;
-        s->plane_stride[n] = stride;
-        s->plane_rows[n] = rows;
-        memcpy_pic(data + used, img->planes[n], row_bytes, rows,
-                   stride, img->stride[n]);
-        used += (uint64_t)stride * rows;
-    }
-
-    s->plane_count = 2;
-    s->format = img->imgfmt == IMGFMT_P010 ? VPSINK_FMT_P010 : VPSINK_FMT_NV12;
     s->width = img->w;
     s->height = img->h;
     s->sar_num = img->params.p_w;
@@ -220,7 +208,76 @@ static bool fill_slot(struct vo *vo, struct vpsink_slot *s,
     s->decoded_ns = img->stamps.decoded_ns;
     s->ready_ns = img->stamps.ready_ns;
     s->queued_ns = img->stamps.queued_ns;
+
+    s->dv_upload_end_ns = s->dv_compose_end_ns = s->dv_readback_end_ns = 0;
+    s->dv_gpu_compose_ns = s->dv_gpu_pack_ns = 0;
+    s->dv_flags = 0;
+}
+
+static bool fill_slot(struct vo *vo, struct vpsink_slot *s,
+                      struct vo_frame *frame, struct mp_image *img)
+{
+    struct priv *p = vo->priv;
+    uint8_t *data = (uint8_t *)s + p->hdr->slot_data_offset;
+    uint64_t used = 0;
+
+    for (int n = 0; n < 2; n++) {
+        int row_bytes = mp_image_plane_w(img, n) * img->fmt.bpp[n] / 8;
+        int rows = mp_image_plane_h(img, n);
+        uint32_t stride = ALIGN_UP(row_bytes, 64);
+        if (used + (uint64_t)stride * rows > p->picture_capacity)
+            return false;
+        s->plane_offset[n] = p->hdr->slot_data_offset + used;
+        s->plane_stride[n] = stride;
+        s->plane_rows[n] = rows;
+        memcpy_pic(data + used, img->planes[n], row_bytes, rows,
+                   stride, img->stride[n]);
+        used += (uint64_t)stride * rows;
+    }
+
+    s->plane_count = 2;
+    s->format = img->imgfmt == IMGFMT_P010 ? VPSINK_FMT_P010 : VPSINK_FMT_NV12;
+    fill_fields(vo, s, frame, img);
     return true;
+}
+
+// Compose a Dolby Vision frame on the GPU straight into the slot as BGRA8.
+static bool fill_slot_dv(struct vo *vo, struct vpsink_slot *s,
+                         struct vo_frame *frame, struct mp_image *img)
+{
+    struct priv *p = vo->priv;
+    uint64_t stride = VPSINK_DV_BGRA_STRIDE(img->w);
+    if (stride * img->h > p->picture_capacity)
+        return false;
+
+    struct vpsink_dv_times t;
+    if (!vpsink_dv_compose(p->dvc, img, (uint8_t *)s + p->hdr->slot_data_offset, &t))
+        return false;
+
+    s->plane_count = 1;
+    s->format = VPSINK_FMT_BGRA8;
+    s->plane_offset[0] = p->hdr->slot_data_offset;
+    s->plane_stride[0] = stride;
+    s->plane_rows[0] = img->h;
+    s->plane_offset[1] = s->plane_stride[1] = s->plane_rows[1] = 0;
+    fill_fields(vo, s, frame, img);
+
+    s->dv_upload_end_ns = t.upload_end_ns;
+    s->dv_compose_end_ns = t.compose_end_ns;
+    s->dv_readback_end_ns = t.readback_end_ns;
+    s->dv_gpu_compose_ns = t.gpu_compose_ns;
+    s->dv_gpu_pack_ns = t.gpu_pack_ns;
+    s->dv_flags = t.el_composed ? VPSINK_DV_EL_COMPOSED : 0;
+    return true;
+}
+
+// A frame is late once it would show more than half a frame after its
+// display time. 0: no time to judge by (a paused redraw).
+static int64_t late_after_ns(struct vo_frame *frame, struct priv *p, bool still)
+{
+    if (still || frame->pts <= 0)
+        return 0;
+    return frame->pts + p->raw_offset + MPMAX(frame->duration, 0) / 2;
 }
 
 // Encoded value (0..1) to linear for trc: PQ in units of CUE_WHITE_NITS,
@@ -432,6 +489,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     if (!img || frame->repeat || (frame->redraw && !still))
         return VO_TRUE;
 
+    // Dolby Vision goes out as the tunnel picture a TV-led player sends. A
+    // frame already late is not composed at all.
+    bool dv = p->dvc && vpsink_dv_frame_ok(img);
+    int64_t late_after = dv ? late_after_ns(frame, p, still) : 0;
+    if (late_after && (int64_t)mp_raw_time_ns() > late_after) {
+        p->hdr->dv_frames_late += 1;
+        return VO_TRUE;
+    }
+
     int n = acquire_slot(p);
     if (n < 0) {
         p->hdr->frames_dropped += 1;
@@ -440,11 +506,20 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     struct vpsink_slot *s = get_slot(p, n);
     s->copy_start_ns = mp_raw_time_ns();
-    bool filled = fill_slot(vo, s, frame, img);
+    bool filled = dv ? fill_slot_dv(vo, s, frame, img) : fill_slot(vo, s, frame, img);
     s->copy_end_ns = mp_raw_time_ns();
     if (!filled) {
         InterlockedExchange((volatile LONG *)&s->state, VPSINK_SLOT_FREE);
-        p->hdr->frames_dropped += 1;
+        if (dv)
+            p->hdr->dv_compose_failed += 1;
+        else
+            p->hdr->frames_dropped += 1;
+        return VO_TRUE;
+    }
+    // Composed too late: drop it rather than publish it late.
+    if (late_after && s->copy_end_ns > late_after) {
+        InterlockedExchange((volatile LONG *)&s->state, VPSINK_SLOT_FREE);
+        p->hdr->dv_frames_late += 1;
         return VO_TRUE;
     }
     if (still)
@@ -489,10 +564,13 @@ static void flip_page(struct vo *vo)
         p->discontinuity = false;
     }
 
+    bool dv = s->format == VPSINK_FMT_BGRA8;    // the reader owns s after this
     MemoryBarrier();
     InterlockedExchange((volatile LONG *)&s->state, VPSINK_SLOT_READY);
 
     p->hdr->frames_published += 1;
+    if (dv)
+        p->hdr->dv_frames_composed += 1;
     p->hdr->mpv_drop_count = vo_get_drop_count(vo);
     SetEvent(p->event);
 }
@@ -521,6 +599,8 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
 static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
+    vpsink_dv_destroy(p->dvc);
+    p->dvc = NULL;
     if (p->hdr) {
         if (p->pending >= 0) {
             InterlockedExchange((volatile LONG *)&get_slot(p, p->pending)->state,
@@ -553,9 +633,11 @@ static int preinit(struct vo *vo)
     uint32_t header_size = ALIGN_UP(sizeof(struct vpsink_header), 4096);
     uint32_t slot_data_offset = ALIGN_UP(sizeof(struct vpsink_slot), 4096);
     // Y plane plus half-height UV plane, 2 bytes per sample, rows padded to 64,
-    // then the cue area.
-    p->picture_capacity = (uint64_t)ALIGN_UP(VPSINK_MAX_WIDTH * 2, 64) *
-                          (VPSINK_MAX_HEIGHT + VPSINK_MAX_HEIGHT / 2);
+    // or a BGRA8 frame, whichever is larger; then the cue area.
+    p->picture_capacity = MPMAX(
+        (uint64_t)ALIGN_UP(VPSINK_MAX_WIDTH * 2, 64) *
+            (VPSINK_MAX_HEIGHT + VPSINK_MAX_HEIGHT / 2),
+        VPSINK_DV_BGRA_STRIDE(VPSINK_MAX_WIDTH) * VPSINK_MAX_HEIGHT);
     uint64_t capacity = p->picture_capacity + VPSINK_CUE_AREA_SIZE;
     uint64_t slot_stride = ALIGN_UP(slot_data_offset + capacity, 4096);
     uint64_t total = header_size + VPSINK_SLOT_COUNT * slot_stride;
@@ -653,6 +735,9 @@ static int preinit(struct vo *vo)
             MP_WARN(vo, "Cannot register the VO thread with MMCSS.\n");
     }
 
+    if (p->dv)
+        p->dvc = vpsink_dv_create(vo, vo->log);
+
     MP_VERBOSE(vo, "Shared memory %s, %u slots of %llu bytes.\n", map_name,
                VPSINK_SLOT_COUNT, (unsigned long long)slot_stride);
     return 0;
@@ -695,6 +780,7 @@ const struct vo_driver video_out_vpsink = {
     .options = (const struct m_option[]) {
         {"name", OPT_STRING(name)},
         {"osd", OPT_BOOL(osd)},
+        {"dv", OPT_BOOL(dv)},
         {0},
     },
     .options_prefix = "vo-vpsink",

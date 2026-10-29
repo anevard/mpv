@@ -516,7 +516,8 @@ if win32
     timer_source = files('osdep/timer-win32.c')
     sources += files('osdep/w32_keyboard.c',
                      'osdep/windows_utils.c',
-                     'video/out/vo_vpsink.c')
+                     'video/out/vo_vpsink.c',
+                     'video/out/vpsink_dv.c')
 endif
 
 features += {'win32-desktop': win32 and not uwp.found()}
