@@ -240,6 +240,8 @@ static size_t build_dm(const DoviVdrDmData *d, uint8_t *body, size_t cap,
         put16(&w, m->level4->anchor_pq);
         put16(&w, m->level4->anchor_power);
         block_end(&b, 4);
+        info->l4_at = b.at;
+        info->l4_len = w.len - b.at;
     }
     if (m->level5) {
         block_begin(&b, 5);

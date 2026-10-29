@@ -39,6 +39,7 @@
 struct vpsink_dvdm_info {
     uint8_t levels[32];         // bit n set: extension level n carried
     int blocks;                 // extension blocks carried
+    size_t l4_at, l4_len;       // body bytes of the L4 block; 0 if none
     char error[128];            // why no body was built, if none was
 };
 
@@ -51,8 +52,9 @@ size_t vpsink_dvdm_build(const uint8_t *rpu, size_t rpu_len, uint8_t *body,
 
 // Packetize body (CRC-32, three copies of each packet) and embed it into the
 // chroma LSBs of a BGRA8 tunnel picture, w * 4 bytes a row, from the first
-// pixel in raster order. id (0..15) names this picture; the metadata
-// describes it (affected = current). False if the picture is too small.
+// pixel in raster order. id (0..15) names the metadata, which describes
+// this picture (affected = current); keep it while the metadata is
+// unchanged. False if the picture is too small.
 bool vpsink_dvdm_embed(uint8_t *bgra, int w, int h, const uint8_t *body,
                        size_t len, unsigned id);
 
