@@ -40,7 +40,8 @@
 #define VPSINK_VERSION      3u
 #define VPSINK_SLOT_COUNT   3u
 
-// Largest frame a slot holds: 4096x2304 P010 (Y plane plus half-height UV).
+// Largest frame a slot holds: 4096x2304, as P010 (Y plane plus half-height
+// UV) or as BGRA8 (4 bytes a pixel; the larger of the two sizes the slot).
 #define VPSINK_MAX_WIDTH    4096u
 #define VPSINK_MAX_HEIGHT   2304u
 
@@ -59,6 +60,11 @@ enum vpsink_format {
     VPSINK_FMT_NONE = 0,
     VPSINK_FMT_NV12 = 1,    // 8-bit 4:2:0, Y plane then interleaved UV plane
     VPSINK_FMT_P010 = 2,    // 10-bit 4:2:0 in the high bits of 16-bit words
+    // One plane, bytes B, G, R, A per pixel, rows of width * 4 bytes; A is
+    // unused. Written only with vo-vpsink-dv: a Dolby Vision RGB tunnel
+    // picture (12-bit 4:2:2 in RGB8, HDMI 1.4a 6.5.4), as a TV-led player
+    // sends it. A reader that does not know it skips the slot.
+    VPSINK_FMT_BGRA8 = 3,
 };
 
 // vpsink_slot.flags
@@ -125,7 +131,7 @@ struct vpsink_slot {
     uint32_t height;
     uint32_t sar_num;           // sample aspect ratio, 0/0 if unknown
     uint32_t sar_den;
-    uint32_t plane_count;       // 2
+    uint32_t plane_count;       // 2; 1 for BGRA8
     uint32_t plane_offset[2];   // from the start of the slot
     uint32_t plane_stride[2];   // bytes per row
     uint32_t plane_rows[2];
@@ -164,7 +170,23 @@ struct vpsink_slot {
 
     struct vpsink_cue sub;      // the subtitle track's cue
     struct vpsink_cue msg;      // mpv's OSD message (vo-vpsink-osd), if any
+
+    // BGRA8 (Dolby Vision) frames only, 0 otherwise; same clock. The compose
+    // runs between copy_start_ns and copy_end_ns: upload of the base layer
+    // (and enhancement layer), the GPU's reshape, NLQ and tunnel pack, then the
+    // read-back into this slot. GPU durations come from GPU timers and lag a
+    // few frames; 0 until the first one finishes.
+    int64_t  dv_upload_end_ns;
+    int64_t  dv_compose_end_ns;
+    int64_t  dv_readback_end_ns;
+    uint64_t dv_gpu_compose_ns; // reshape and NLQ pass
+    uint64_t dv_gpu_pack_ns;    // 4:2:2 and tunnel pack pass
+    uint32_t dv_flags;          // VPSINK_DV_*
+    uint32_t reserved1;
 };
+
+// vpsink_slot.dv_flags
+#define VPSINK_DV_EL_COMPOSED       (1u << 0)   // FEL residual added (NLQ)
 
 struct vpsink_header {
     uint32_t magic;             // VPSINK_MAGIC
@@ -186,7 +208,13 @@ struct vpsink_header {
     volatile uint64_t discontinuities;
     volatile int64_t  mpv_drop_count;       // mpv's own late-frame drops
 
-    uint32_t reserved[32];
+    // Dolby Vision (vo-vpsink-dv). A late frame is dropped, never waited
+    // for: composing it would hold the VO thread while newer frames queue.
+    volatile uint64_t dv_frames_composed;   // BGRA8 frames published
+    volatile uint64_t dv_frames_late;       // dropped: past their display time
+    volatile uint64_t dv_compose_failed;    // dropped: GPU or format failure
+
+    uint32_t reserved[26];
 };
 
 #endif
