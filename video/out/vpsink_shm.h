@@ -182,7 +182,7 @@ struct vpsink_slot {
     uint64_t dv_gpu_compose_ns; // reshape and NLQ pass
     uint64_t dv_gpu_pack_ns;    // 4:2:2 and tunnel pack pass
     uint32_t dv_flags;          // VPSINK_DV_*
-    uint32_t reserved1;
+    uint32_t dv_dm_bytes;       // DM metadata body embedded in the picture
 };
 
 // vpsink_slot.dv_flags
@@ -213,8 +213,9 @@ struct vpsink_header {
     volatile uint64_t dv_frames_composed;   // BGRA8 frames published
     volatile uint64_t dv_frames_late;       // dropped: past their display time
     volatile uint64_t dv_compose_failed;    // dropped: GPU or format failure
+    volatile uint64_t dv_dm_failed;         // of those: no usable DM metadata
 
-    uint32_t reserved[26];
+    uint32_t reserved[24];
 };
 
 #endif
