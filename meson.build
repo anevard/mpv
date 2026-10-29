@@ -519,6 +519,8 @@ if win32
                      'video/out/vo_vpsink.c',
                      'video/out/vpsink_dv.c',
                      'video/out/vpsink_dvdm.c')
+    # vpsink_dvdm parses the raw Dolby Vision RPU; the version built against.
+    dependencies += dependency('dovi', version: '>= 3.4.0')
 endif
 
 features += {'win32-desktop': win32 and not uwp.found()}

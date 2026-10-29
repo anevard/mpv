@@ -29,7 +29,6 @@
 #include <windows.h>
 #include <avrt.h>
 
-#include <libavutil/dovi_meta.h>
 #include <libavutil/frame.h>
 #include <libavutil/mastering_display_metadata.h>
 
@@ -261,9 +260,8 @@ static void log_dm(struct vo *vo, const struct vpsink_dvdm_info *dm, size_t len)
         if (dm->levels[l / 8] & (1u << (l % 8)))
             at += snprintf(list + at, sizeof(list) - at, " L%d", l);
     }
-    MP_INFO(vo, "Dolby Vision DM: %zu bytes, %d blocks:%s%s\n", len,
-            dm->blocks, at ? list : " none",
-            dm->skipped ? " (blocks of unknown levels skipped)" : "");
+    MP_INFO(vo, "Dolby Vision DM: %zu bytes, %d blocks:%s\n", len,
+            dm->blocks, at ? list : " none");
     p->dm_bytes = len;
     memcpy(p->dm_levels, dm->levels, sizeof(dm->levels));
 }
@@ -278,18 +276,20 @@ static bool fill_slot_dv(struct vo *vo, struct vpsink_slot *s,
     if (stride * img->h > p->picture_capacity)
         return false;
 
-    const AVDOVIMetadata *md = NULL;
+    const AVBufferRef *rpu = NULL;
     for (int n = 0; n < img->num_ff_side_data; n++) {
-        if (img->ff_side_data[n].type == AV_FRAME_DATA_DOVI_METADATA)
-            md = (const AVDOVIMetadata *)img->ff_side_data[n].buf->data;
+        if (img->ff_side_data[n].type == AV_FRAME_DATA_DOVI_RPU_BUFFER)
+            rpu = img->ff_side_data[n].buf;
     }
     struct vpsink_dvdm_info dm;
-    size_t dm_len = vpsink_dvdm_build(md, p->dm_body, VPSINK_DVDM_MAX_BYTES, &dm);
+    size_t dm_len = vpsink_dvdm_build(rpu ? rpu->data : NULL, rpu ? rpu->size : 0,
+                                      p->dm_body, VPSINK_DVDM_MAX_BYTES, &dm);
     if (!dm_len) {
         // Without DM the tunnel picture would reach VP as plain RGB.
         p->hdr->dv_dm_failed += 1;
         if (!p->dm_warned)
-            MP_WARN(vo, "Dolby Vision frame without usable DM metadata; dropped.\n");
+            MP_WARN(vo, "Dolby Vision frame without usable DM metadata (%s); "
+                    "dropped.\n", dm.error);
         p->dm_warned = true;
         return false;
     }

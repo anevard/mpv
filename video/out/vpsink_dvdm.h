@@ -32,7 +32,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-struct AVDOVIMetadata;
 
 // Largest DM body VP's tunnel reader accepts.
 #define VPSINK_DVDM_MAX_BYTES 0x2F00
@@ -40,12 +39,14 @@ struct AVDOVIMetadata;
 struct vpsink_dvdm_info {
     uint8_t levels[32];         // bit n set: extension level n carried
     int blocks;                 // extension blocks carried
-    int skipped;                // blocks of a level with no wire layout here
+    char error[128];            // why no body was built, if none was
 };
 
-// Build the DM body for one picture from ffmpeg's parsed RPU. Returns its
-// length in bytes, or 0 if md is unusable or the body would exceed cap.
-size_t vpsink_dvdm_build(const struct AVDOVIMetadata *md, uint8_t *body,
+// Build the DM body for one picture from the frame's raw RPU (ffmpeg's
+// AV_FRAME_DATA_DOVI_RPU_BUFFER, an HEVC UNSPEC62 NAL unit), parsed by
+// libdovi; each RPU field goes once to its wire bytes. Returns the length in
+// bytes, or 0 with info->error set.
+size_t vpsink_dvdm_build(const uint8_t *rpu, size_t rpu_len, uint8_t *body,
                          size_t cap, struct vpsink_dvdm_info *info);
 
 // Packetize body (CRC-32, three copies of each packet) and embed it into the
