@@ -7,7 +7,7 @@
  * NLQ-composed, cut to 12-bit 4:2:2 and laid out as BGRA8 there, then read
  * back into the caller's buffer: the composed picture before the RPU's
  * nonlinear matrix, as a TV-led source sends it over HDMI. The DM packets are
- * not written here.
+ * written over it afterwards (vpsink_dvdm.c).
  *
  * This file is part of mpv.
  *

@@ -29,6 +29,7 @@
 #include <windows.h>
 #include <avrt.h>
 
+#include <libavutil/dovi_meta.h>
 #include <libavutil/frame.h>
 #include <libavutil/mastering_display_metadata.h>
 
@@ -44,6 +45,7 @@
 #include "video/mp_image.h"
 #include "vo.h"
 #include "vpsink_dv.h"
+#include "vpsink_dvdm.h"
 #include "vpsink_shm.h"
 
 #define ALIGN_UP(x, a) (((x) + (a) - 1) / (a) * (a))
@@ -81,6 +83,11 @@ struct priv {
     bool dv;                    // compose Dolby Vision frames as BGRA8 tunnel
                                 // pictures (vpsink_dv.c)
     struct vpsink_dv *dvc;      // NULL unless dv
+    uint8_t *dm_body;           // DM metadata of the frame being written
+    unsigned dm_id;             // metadata id of the next DV picture (mod 16)
+    uint8_t dm_levels[32];      // extension levels last logged
+    size_t dm_bytes;            // DM body length last logged
+    bool dm_warned;
 
     HANDLE map;
     HANDLE event;
@@ -241,7 +248,28 @@ static bool fill_slot(struct vo *vo, struct vpsink_slot *s,
     return true;
 }
 
-// Compose a Dolby Vision frame on the GPU straight into the slot as BGRA8.
+// Log the DM metadata's extension levels whenever the set or the size
+// changes, to check against VP's tunnel log ("extension Ln").
+static void log_dm(struct vo *vo, const struct vpsink_dvdm_info *dm, size_t len)
+{
+    struct priv *p = vo->priv;
+    if (len == p->dm_bytes && !memcmp(dm->levels, p->dm_levels, sizeof(dm->levels)))
+        return;
+    char list[256 * 5] = "";
+    size_t at = 0;
+    for (int l = 0; l < 256; l++) {
+        if (dm->levels[l / 8] & (1u << (l % 8)))
+            at += snprintf(list + at, sizeof(list) - at, " L%d", l);
+    }
+    MP_INFO(vo, "Dolby Vision DM: %zu bytes, %d blocks:%s%s\n", len,
+            dm->blocks, at ? list : " none",
+            dm->skipped ? " (blocks of unknown levels skipped)" : "");
+    p->dm_bytes = len;
+    memcpy(p->dm_levels, dm->levels, sizeof(dm->levels));
+}
+
+// Compose a Dolby Vision frame on the GPU straight into the slot as BGRA8,
+// then embed its DM metadata packets.
 static bool fill_slot_dv(struct vo *vo, struct vpsink_slot *s,
                          struct vo_frame *frame, struct mp_image *img)
 {
@@ -250,9 +278,32 @@ static bool fill_slot_dv(struct vo *vo, struct vpsink_slot *s,
     if (stride * img->h > p->picture_capacity)
         return false;
 
-    struct vpsink_dv_times t;
-    if (!vpsink_dv_compose(p->dvc, img, (uint8_t *)s + p->hdr->slot_data_offset, &t))
+    const AVDOVIMetadata *md = NULL;
+    for (int n = 0; n < img->num_ff_side_data; n++) {
+        if (img->ff_side_data[n].type == AV_FRAME_DATA_DOVI_METADATA)
+            md = (const AVDOVIMetadata *)img->ff_side_data[n].buf->data;
+    }
+    struct vpsink_dvdm_info dm;
+    size_t dm_len = vpsink_dvdm_build(md, p->dm_body, VPSINK_DVDM_MAX_BYTES, &dm);
+    if (!dm_len) {
+        // Without DM the tunnel picture would reach VP as plain RGB.
+        p->hdr->dv_dm_failed += 1;
+        if (!p->dm_warned)
+            MP_WARN(vo, "Dolby Vision frame without usable DM metadata; dropped.\n");
+        p->dm_warned = true;
         return false;
+    }
+
+    uint8_t *pic = (uint8_t *)s + p->hdr->slot_data_offset;
+    struct vpsink_dv_times t;
+    if (!vpsink_dv_compose(p->dvc, img, pic, &t))
+        return false;
+    if (!vpsink_dvdm_embed(pic, img->w, img->h, p->dm_body, dm_len, p->dm_id)) {
+        p->hdr->dv_dm_failed += 1;
+        return false;
+    }
+    p->dm_id = (p->dm_id + 1) & 15;
+    log_dm(vo, &dm, dm_len);
 
     s->plane_count = 1;
     s->format = VPSINK_FMT_BGRA8;
@@ -268,6 +319,7 @@ static bool fill_slot_dv(struct vo *vo, struct vpsink_slot *s,
     s->dv_gpu_compose_ns = t.gpu_compose_ns;
     s->dv_gpu_pack_ns = t.gpu_pack_ns;
     s->dv_flags = t.el_composed ? VPSINK_DV_EL_COMPOSED : 0;
+    s->dv_dm_bytes = dm_len;
     return true;
 }
 
@@ -735,8 +787,10 @@ static int preinit(struct vo *vo)
             MP_WARN(vo, "Cannot register the VO thread with MMCSS.\n");
     }
 
-    if (p->dv)
+    if (p->dv) {
         p->dvc = vpsink_dv_create(vo, vo->log);
+        p->dm_body = talloc_size(p, VPSINK_DVDM_MAX_BYTES);
+    }
 
     MP_VERBOSE(vo, "Shared memory %s, %u slots of %llu bytes.\n", map_name,
                VPSINK_SLOT_COUNT, (unsigned long long)slot_stride);
