@@ -83,7 +83,10 @@ struct priv {
                                 // pictures (vpsink_dv.c)
     struct vpsink_dv *dvc;      // NULL unless dv
     uint8_t *dm_body;           // DM metadata of the frame being written
-    unsigned dm_id;             // metadata id of the next DV picture (mod 16)
+    uint8_t *dm_sent;           // DM metadata last embedded under dm_id
+    size_t dm_sent_len;         // its length; 0 before the first DV picture
+    size_t dm_sent_l4_at, dm_sent_l4_len; // its L4 block, if any
+    unsigned dm_id;             // metadata id of the last DV picture (mod 16)
     uint8_t dm_levels[32];      // extension levels last logged
     size_t dm_bytes;            // DM body length last logged
     bool dm_warned;
@@ -266,6 +269,23 @@ static void log_dm(struct vo *vo, const struct vpsink_dvdm_info *dm, size_t len)
     memcpy(p->dm_levels, dm->levels, sizeof(dm->levels));
 }
 
+// Whether the DM body equals the one last sent, leaving out what changes
+// without new metadata for VP: scene_refresh_flag (byte 1, set on a scene's
+// first picture only, so it would change the id twice a scene) and the L4
+// block (global-dimming hints, per picture; VP does not apply L4).
+static bool dm_same(struct priv *p, const struct vpsink_dvdm_info *dm,
+                    size_t len)
+{
+    if (len != p->dm_sent_len || dm->l4_at != p->dm_sent_l4_at ||
+        dm->l4_len != p->dm_sent_l4_len)
+        return false;
+    size_t mid = dm->l4_len ? dm->l4_at : len;
+    size_t tail = mid + dm->l4_len;
+    return !memcmp(p->dm_body, p->dm_sent, 1) &&
+           !memcmp(p->dm_body + 2, p->dm_sent + 2, mid - 2) &&
+           !memcmp(p->dm_body + tail, p->dm_sent + tail, len - tail);
+}
+
 // Compose a Dolby Vision frame on the GPU straight into the slot as BGRA8,
 // then embed its DM metadata packets.
 static bool fill_slot_dv(struct vo *vo, struct vpsink_slot *s,
@@ -298,11 +318,22 @@ static bool fill_slot_dv(struct vo *vo, struct vpsink_slot *s,
     struct vpsink_dv_times t;
     if (!vpsink_dv_compose(p->dvc, img, pic, &t))
         return false;
-    if (!vpsink_dvdm_embed(pic, img->w, img->h, p->dm_body, dm_len, p->dm_id)) {
+    // A new id only when the metadata changes: VP drops its active DM on an
+    // id change, so a picture whose later packets are lost would otherwise
+    // go black instead of keeping the last DM.
+    bool changed = !dm_same(p, &dm, dm_len);
+    unsigned id = changed ? (p->dm_id + 1) & 15 : p->dm_id;
+    if (!vpsink_dvdm_embed(pic, img->w, img->h, p->dm_body, dm_len, id)) {
         p->hdr->dv_dm_failed += 1;
         return false;
     }
-    p->dm_id = (p->dm_id + 1) & 15;
+    if (changed) {
+        p->dm_id = id;
+        memcpy(p->dm_sent, p->dm_body, dm_len);
+        p->dm_sent_len = dm_len;
+        p->dm_sent_l4_at = dm.l4_at;
+        p->dm_sent_l4_len = dm.l4_len;
+    }
     log_dm(vo, &dm, dm_len);
 
     s->plane_count = 1;
@@ -790,6 +821,7 @@ static int preinit(struct vo *vo)
     if (p->dv) {
         p->dvc = vpsink_dv_create(vo, vo->log);
         p->dm_body = talloc_size(p, VPSINK_DVDM_MAX_BYTES);
+        p->dm_sent = talloc_size(p, VPSINK_DVDM_MAX_BYTES);
     }
 
     MP_VERBOSE(vo, "Shared memory %s, %u slots of %llu bytes.\n", map_name,
