@@ -358,6 +358,12 @@ void mp_output_chain_reset_harder(struct mp_output_chain *c)
         p->ao = NULL;
         mp_autoconvert_clear(p->convert);
     }
+
+    // The reset drops the requests inside the chain, but not one the chain's
+    // reader already made on its output pin. That reader does not ask again,
+    // so run the chain once to pass the request on. Without this, the spdif
+    // to PCM fallback could leave audio (and with it playback) never starting.
+    mp_filter_wakeup(p->f);
 }
 
 static void output_chain_destroy(struct mp_filter *f)
