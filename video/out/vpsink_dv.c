@@ -158,6 +158,7 @@ struct plane_fmt {
     int ids[MAX_PLANES][2];     // 1 = Y, 2 = Cb, 3 = Cr (mp_regular_imgfmt)
     int bytes;                  // per sample
     float scale;                // texture value -> normalised code
+    float code_max;             // 2^depth - 1: normalised code -> code
 };
 
 static bool get_plane_fmt(struct plane_fmt *f, int imgfmt)
@@ -186,7 +187,8 @@ static bool get_plane_fmt(struct plane_fmt *f, int imgfmt)
     int bits = reg.component_size * 8;
     int lsb_pad = MPMAX(reg.component_pad, 0);      // >0: LSB padding (P010)
     int depth = bits - abs(reg.component_pad);
-    f->scale = (float)((1 << bits) - 1) / (1 << lsb_pad) / ((1 << depth) - 1);
+    f->code_max = (float)((1 << depth) - 1);
+    f->scale = (float)((1 << bits) - 1) / (1 << lsb_pad) / f->code_max;
     return true;
 }
 
@@ -230,10 +232,10 @@ static bool sample_layer(struct vpsink_dv *dv, pl_shader sh, void *ta,
                          const char *pre, const char *out, const char *post)
 {
     struct pl_shader_desc descs[MAX_PLANES];
-    struct pl_shader_var vars[2 * MAX_PLANES + 1 + 3];
+    struct pl_shader_var vars[2 * MAX_PLANES + 1 + 5];
     struct plane_map maps[MAX_PLANES];
     int nv = 0;
-    assert(num_extra <= 3);
+    assert(num_extra <= 5);
     for (int i = 0; i < num_extra; i++)
         vars[nv++] = extra[i];
 
@@ -323,8 +325,18 @@ static bool compose_pass(struct vpsink_dv *dv, void *ta, struct mp_image *img,
         return false;
 
     pl_shader sh = pl_dispatch_begin(dv->dp);
+#if PL_API_VER >= 387
+    // API 387 (pl_shader_decode_color_ex): the reshaping, and its pivots,
+    // take the BL code divided by 2^BL_bit_depth, not by 2^depth - 1.
+    float bl_dovi_scale = blf->code_max / (blf->code_max + 1.0f);
+    struct pl_shader_var bl_var = { pl_var_float("bl_dovi_scale"), &bl_dovi_scale };
+    ok = sample_layer(dv, sh, ta, "bl", &dv->bl, img, blf, w, h, 0, 0, 1, 1,
+                      PL_SHADER_SIG_NONE, &bl_var, 1, "color.a = 1.0;\n", "color",
+                      "color.rgb *= bl_dovi_scale;\n");
+#else
     ok = sample_layer(dv, sh, ta, "bl", &dv->bl, img, blf, w, h, 0, 0, 1, 1,
                       PL_SHADER_SIG_NONE, NULL, 0, "color.a = 1.0;\n", "color", "");
+#endif
     if (ok)
         pl_shader_dovi_reshape(sh, dovi);
 
@@ -348,6 +360,28 @@ static bool compose_pass(struct vpsink_dv *dv, void *ta, struct mp_image *img,
         }
         // LINEAR_DZ dequantisation from the public nlq fields, as libplacebo's
         // own FEL composer applies it.
+#if PL_API_VER >= 387
+        // API 387 (sh_dovi_compose_nlq): offset is in EL codes, the EL is
+        // read as codes rounded after the resampling, rr = 0 adds nothing,
+        // the residual is bounded by hdr_in_max and the result clamped.
+        float hdr_max[3];
+        for (int c = 0; c < 3; c++)
+            hdr_max[c] = dovi->nlq[c].hdr_in_max;
+        struct pl_shader_var nlq[5] = {
+            { pl_var_vec3("nlq_off"), off },
+            { pl_var_vec3("nlq_slope"), slope },
+            { pl_var_vec3("nlq_thr"), thr },
+            { pl_var_vec3("nlq_max"), hdr_max },
+            { pl_var_float("el_code_max"), &elf->code_max },
+        };
+        ok = sample_layer(dv, sh, ta, "el", &dv->el, el, elf, w, h, lx, ly,
+                          rlx, rly, PL_SHADER_SIG_COLOR, nlq, 5,
+                          "vec3 el = vec3(0.0);\n", "el",
+                          "vec3 rr = round(el * el_code_max - nlq_off);\n"
+                          "vec3 res = sign(rr) * ((abs(rr) - 0.5) * nlq_slope + nlq_thr);\n"
+                          "color.rgb += clamp(res, -nlq_max, nlq_max);\n"
+                          "color.rgb = clamp(color.rgb, 0.0, 1.0);\n");
+#else
         struct pl_shader_var nlq[3] = {
             { pl_var_vec3("nlq_off"), off },
             { pl_var_vec3("nlq_slope"), slope },
@@ -358,6 +392,7 @@ static bool compose_pass(struct vpsink_dv *dv, void *ta, struct mp_image *img,
                           "vec3 el = vec3(0.0);\n", "el",
                           "vec3 elc = el - nlq_off;\n"
                           "color.rgb += sign(elc) * (abs(elc) * nlq_slope + nlq_thr);\n");
+#endif
     }
 
     if (!ok) {
