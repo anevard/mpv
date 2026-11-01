@@ -108,7 +108,10 @@ struct vpsink_cue {
     uint64_t id;                // 0: no cue on this frame. Otherwise unique
                                 // to one image; repeats while it is unchanged
     int32_t  x;                 // bounds in the frame's pixels (width x
-    int32_t  y;                 // height, before sample aspect ratio)
+    int32_t  y;                 // height, before sample aspect ratio):
+                                // 0 <= x, x + w <= width. A cue in a film's
+                                // bars lies above or below the frame, within
+                                // y >= -height and y + h <= 2 * height
     uint32_t w;
     uint32_t h;
     uint32_t offset;            // from the start of the slot
