@@ -72,7 +72,8 @@ struct cue {
     bool valid;                 // change_id and the pixels below are current
     int64_t change_id;          // of the sub_bitmap_list last rendered
     uint64_t id;                // 0: nothing showing
-    struct mp_rect rc;          // bounds in the frame's pixels
+    struct mp_rect rc;          // bounds in the canvas's pixels (cue_canvas)
+    int top;                    // canvas rows above the frame
     uint8_t *px;                // rc's pixels, BGRA premultiplied, w * 4 a row
 };
 
@@ -459,6 +460,25 @@ static struct mp_rect tight_bounds(struct mp_image *ov, struct mp_rect rc)
     return t;
 }
 
+// The canvas cues are rendered on: the frame's width with a 16:9 display
+// height, the extra rows split into top and bottom margins, so mpv can place
+// a subtitle in the bars of a film wider than 16:9. A frame of 16:9 or taller
+// gets no margins. Capped at VPSINK_MAX_HEIGHT, so a cue always fits the cue
+// area.
+static struct mp_osd_res cue_canvas(const struct mp_image_params *params)
+{
+    struct mp_osd_res res = osd_res_from_image_params(params);
+    double sar = params->p_w > 0 && params->p_h > 0
+                 ? params->p_w / (double)params->p_h : 1.0;
+    int h = MPMIN(lrint(params->w * sar * 9.0 / 16.0), (long)VPSINK_MAX_HEIGHT);
+    if (h > res.h) {
+        res.mt = (h - res.h) / 2;
+        res.mb = h - res.h - res.mt;
+        res.h = h;
+    }
+    return res;
+}
+
 // Bring cue c up to date for img's time. Renders only when mpv reports a
 // change; a changed image gets a new id.
 static void render_cue(struct vo *vo, struct cue *c, struct mp_image *img,
@@ -466,9 +486,9 @@ static void render_cue(struct vo *vo, struct cue *c, struct mp_image *img,
 {
     struct priv *p = vo->priv;
 
+    struct mp_osd_res res = cue_canvas(&img->params);
     struct sub_bitmap_list *sbs =
-        osd_render(vo->osd, osd_res_from_image_params(&img->params), img->pts,
-                   draw_flags, mp_draw_sub_formats);
+        osd_render(vo->osd, res, img->pts, draw_flags, mp_draw_sub_formats);
     if (c->valid && sbs->change_id == c->change_id) {
         talloc_free(sbs);
         return;
@@ -503,6 +523,7 @@ static void render_cue(struct vo *vo, struct cue *c, struct mp_image *img,
         return;
 
     c->rc = tight_bounds(ov, act);
+    c->top = res.mt;
     int w = c->rc.x1 - c->rc.x0, h = c->rc.y1 - c->rc.y0;
     if (w <= 0 || h <= 0)
         return;
@@ -533,7 +554,7 @@ static void put_cue(struct priv *p, struct vpsink_slot *s, struct vpsink_cue *ds
     *dst = (struct vpsink_cue){
         .id = c->id,
         .x = c->rc.x0,
-        .y = c->rc.y0,
+        .y = c->rc.y0 - c->top,     // negative or past the frame in a bar
         .w = w,
         .h = h,
         .offset = offset,
