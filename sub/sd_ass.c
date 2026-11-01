@@ -47,6 +47,8 @@ struct sd_ass_priv {
     struct ass_track *ass_track;
     struct ass_track *shadow_track; // for --sub-ass=no rendering
     bool ass_configured;
+    float down_pct;     // --sub-pos above 100, applied by hold_at_bottom()
+    int last_down;      // rows moved down on the last render
     bool is_converted;
     struct lavc_conv *converter;
     struct sd_filter **filters;
@@ -579,6 +581,10 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
             set_font_scale /= factor;
     }
     ass_set_use_margins(priv, set_use_margins);
+    // libass moves text below its default place off the screen; the move
+    // down is done by hold_at_bottom() instead, which stops at the edge.
+    ctx->down_pct = MPMAX(-set_sub_pos, 0.0f);
+    set_sub_pos = MPMAX(set_sub_pos, 0.0f);
     ass_set_line_position(priv, set_sub_pos);
     ass_set_shaper(priv, opts->sub_shaper);
     int set_force_flags = 0;
@@ -735,6 +741,30 @@ static long long find_timestamp(struct sd *sd, double pts)
 
 #undef END
 
+// Move the lower subtitles down by down_pct of the screen height, as
+// --sub-pos above 100 asks, but only until the lowest reaches the bottom of
+// the screen: like sd_lavc.c does for image subtitles, it never leaves the
+// screen. Images in the upper half (top titles, signs) stay. Returns the
+// rows moved.
+static int hold_at_bottom(struct sd_ass_priv *ctx, ASS_Image *imgs, int h)
+{
+    if (ctx->down_pct <= 0 || h <= 0)
+        return 0;
+    int bottom = 0;
+    for (ASS_Image *img = imgs; img; img = img->next) {
+        if (img->dst_y + img->h / 2 >= h / 2)
+            bottom = MPMAX(bottom, img->dst_y + img->h);
+    }
+    int down = MPMIN(lrintf(ctx->down_pct / 100.0f * h), h - bottom);
+    if (!bottom || down <= 0)
+        return 0;
+    for (ASS_Image *img = imgs; img; img = img->next) {
+        if (img->dst_y + img->h / 2 >= h / 2)
+            img->dst_y += down;
+    }
+    return down;
+}
+
 static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
                                        int format, double pts)
 {
@@ -791,6 +821,11 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
 
     int changed;
     ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
+    int down = hold_at_bottom(ctx, imgs, dim.h);
+    if (down != ctx->last_down) {
+        changed = 2;
+        ctx->last_down = down;
+    }
     mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
 
 done:
