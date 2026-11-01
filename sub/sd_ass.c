@@ -765,6 +765,20 @@ static int hold_at_bottom(struct sd_ass_priv *ctx, ASS_Image *imgs, int h)
     return down;
 }
 
+// Undo hold_at_bottom() once the images are packed. libass compares each
+// frame's images with the previous frame's list to report a change, so a
+// list left moved reads as a new position on every frame. A moved image is
+// still in the lower half, so the same test finds it.
+static void unhold(ASS_Image *imgs, int h, int down)
+{
+    if (down <= 0)
+        return;
+    for (ASS_Image *img = imgs; img; img = img->next) {
+        if (img->dst_y + img->h / 2 >= h / 2)
+            img->dst_y -= down;
+    }
+}
+
 static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
                                        int format, double pts)
 {
@@ -827,6 +841,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
         ctx->last_down = down;
     }
     mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
+    unhold(imgs, dim.h, down);
 
 done:
     // mangle_colors() modifies the color field, so copy the thing _before_.
